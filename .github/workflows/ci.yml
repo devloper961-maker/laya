@@ -280,7 +280,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch
           pip install -e ".[serve]"
-          pip install pytest
+          pip install pytest httpx
         shell: bash
 
       # bash on this runner so the quoting rules match the Linux job; the default shell on a
