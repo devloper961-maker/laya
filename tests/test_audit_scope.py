@@ -90,71 +90,93 @@ check("pyproject/extras add names the core does not have",
        ["crewai", "fastapi", "langchain-core", "langgraph", "llama-index-core", "mcp", "onnx",
         "onnxruntime", "onnxscript", "pydantic", "python-multipart", "tilelang", "uvicorn"])
 
-# ---------------------------------------------------------------- the job's own extractor
+# ---------------------------------------------------------------- the job's two extractors
 deps_job = "\n".join(section(read(os.path.join(".github", "workflows", "security.yml")),
                              "  deps:"))
 check_true("security.yml/has a deps job", "pip-audit" in deps_job, deps_job[:80])
 
-m = re.search(r"python - <<'PY' > requirements-audit\.txt\n(.*?)\n\s*PY\n", deps_job, re.S)
-check_true("security.yml/exactly one heredoc writes the audit list",
-           m is not None and len(re.findall(r"<<'PY'", deps_job)) == 1,
-           "the extractor has to be liftable as text for this file to check it")
-extractor = ""
-if m:
-    body = m.group(1)
+# The blocking list is core + [serve] (what the published image installs); the other extras
+# are audited separately with advisory findings. Two extractors, each liftable as text.
+heredocs = re.findall(r"python - <<'PY' > (requirements-audit-[a-z]+\.txt)\n(.*?)\n\s*PY\n",
+                      deps_job, re.S)
+check("security.yml/two heredocs write audit lists", sorted(name for name, _ in heredocs),
+       ["requirements-audit-core.txt", "requirements-audit-extras.txt"])
+extractors = {}
+for name, body in heredocs:
     indents = [len(l) - len(l.lstrip()) for l in body.splitlines() if l.strip()]
-    extractor = "\n".join(l[min(indents):] if l.strip() else "" for l in body.splitlines())
+    extractors[name] = "\n".join(l[min(indents):] if l.strip() else "" for l in body.splitlines())
+core_extractor = extractors.get("requirements-audit-core.txt", "")
+extras_extractor = extractors.get("requirements-audit-extras.txt", "")
 
-# Why the extractor is read out of the workflow instead of re-implemented here: the failure mode
-# this file exists for is the two surfaces drifting, so a check that carries its own copy of the
-# parsing rules would drift in exactly the same direction and stay green.
-check_true("extractor/reads the tables with tomllib, not a regex on one array",
-           "tomllib" in extractor and "dependencies = \\[" not in extractor, extractor[:200])
-check_true("extractor/walks optional-dependencies",
-           "optional-dependencies" in extractor, extractor[:200])
+for label, extractor in (("core", core_extractor), ("extras", extras_extractor)):
+    # Why the extractors are read out of the workflow instead of re-implemented here: the failure
+    # mode this file exists for is the two surfaces drifting, so a check with its own copy of the
+    # parsing rules would drift in exactly the same direction and stay green.
+    check_true("extractor/%s/reads the tables with tomllib, not a regex on one array" % label,
+               "tomllib" in extractor and "dependencies = \\[" not in extractor, extractor[:200])
+    check_true("extractor/%s/walks optional-dependencies" % label,
+               "optional-dependencies" in extractor, extractor[:200])
+check_true("extractor/core/audits [serve], which the image installs",
+           '"serve"' in core_extractor, core_extractor[:300])
+check_true("extractor/extras/skips [serve], already audited strictly",
+           "serve" in extras_extractor and "continue" in extras_extractor, extras_extractor[:300])
 check_true("extractor/keeps the declared-not-installed reason",
            "local version" in deps_job and "+cpu" in deps_job,
            "auditing an install would trip --strict on torch's 2.14.0+cpu")
-check_true("extractor/still audits the file strictly",
-           re.search(r"pip-audit --strict[^\n]*-r requirements-audit\.txt", deps_job) is not None,
+check_true("extractor/still audits the shipped file strictly",
+           re.search(r"pip-audit --strict[^\n]*-r requirements-audit-core\.txt", deps_job) is not None,
            deps_job[:120])
-check_true("extractor/prints the scope it audited",
-           re.search(r'echo "[^"]*requirements-audit\.txt', deps_job) is not None,
-           "when the job goes red the log has to say how many names were in scope")
+check_true("extras audit errors still block, findings are advisory",
+           "known vulnerabilities" in deps_job and "::warning::" in deps_job
+           and "::error::" in deps_job, deps_job[:400])
+for name in ("requirements-audit-core.txt", "requirements-audit-extras.txt"):
+    check_true("extractor/prints the scope of %s" % name,
+               re.search(r'echo "[^"]*' + re.escape(name), deps_job) is not None,
+               "when the job goes red the log has to say how many names were in scope")
 
 pin = re.search(r"python-version:\s*[\"'](\d+)\.(\d+)[\"']", deps_job)
 check_true("security.yml/the deps job pins python >= 3.11",
            pin is not None and tuple(map(int, pin.groups())) >= (3, 11),
-           "tomllib, which the extractor reads the tables with, is 3.11+")
+           "tomllib, which the extractors read the tables with, is 3.11+")
 
 ran = False
-if sys.version_info >= (3, 11) and extractor:
+if sys.version_info >= (3, 11) and extractors:
     ran = True
-    run = subprocess.run([sys.executable, "-c", extractor], cwd=ROOT,
-                         capture_output=True, text=True)
-    check_true("extractor/runs against the real pyproject.toml",
-               run.returncode == 0, run.stderr.strip()[:300])
-    emitted = [l.strip() for l in run.stdout.splitlines() if l.strip()]
-    check("extractor/emits every declared name, core and extras alike", sorted(set(emitted)),
-          expected)
-    # Specifiers carried through, not stripped: `fastapi` alone would audit whatever PyPI serves
-    # today and hide the floor the package actually supports.
-    check_true("extractor/preserves each version specifier",
-               all(e in declared for e in emitted),
-               [e for e in emitted if e not in declared])
-    check_true("extractor/collapses the langchain/langgraph duplicate",
-               len(emitted) == len(set(emitted)),
-               [s for s in emitted if emitted.count(s) > 1])
+    scopes = {
+        "requirements-audit-core.txt": sorted(set(core + extras.get("serve", []))),
+        "requirements-audit-extras.txt": sorted(
+            set(s for extra, specs in extras.items() if extra != "serve" for s in specs)
+        ),
+    }
+    emitted_by_scope = {}
+    for name, expected_scope in scopes.items():
+        run = subprocess.run([sys.executable, "-c", extractors[name]], cwd=ROOT,
+                             capture_output=True, text=True)
+        check_true("extractor/%s/runs against the real pyproject.toml" % name,
+                   run.returncode == 0, run.stderr.strip()[:300])
+        emitted = [l.strip() for l in run.stdout.splitlines() if l.strip()]
+        emitted_by_scope[name] = emitted
+        check("extractor/%s/emits every declared name in its scope" % name,
+              sorted(set(emitted)), expected_scope)
+        # Specifiers carried through, not stripped: `fastapi` alone would audit whatever PyPI serves
+        # today and hide the floor the package actually supports.
+        check_true("extractor/%s/preserves each version specifier" % name,
+                   all(e in declared for e in emitted),
+                   [e for e in emitted if e not in declared])
+        check_true("extractor/%s/collapses duplicates" % name,
+                   len(emitted) == len(set(emitted)),
+                   [s for s in emitted if emitted.count(s) > 1])
     for name in ("fastapi", "uvicorn", "python-multipart"):
-        check_true("extractor/audits %s, which the image installs" % name,
-                   any(re.split(r"[<>=!;\[ ]", s)[0] == name for s in emitted),
+        check_true("extractor/core/audits %s, which the image installs" % name,
+                   any(re.split(r"[<>=!;\[ ]", s)[0] == name
+                       for s in emitted_by_scope.get("requirements-audit-core.txt", [])),
                    "Dockerfile installs it through the `serve` extra")
 else:
-    NOTES.append("python %d.%d has no tomllib: the extractor was not executed here, only its "
+    NOTES.append("python %d.%d has no tomllib: the extractors were not executed here, only their "
                  "source was checked (the job pins 3.11+)" % sys.version_info[:2])
-# Where the interpreter can run the extractor, it must have. Without this the skip above is a
+# Where the interpreter can run the extractors, they must have. Without this the skip above is a
 # hole a mutant can open -- `if False` would leave the file green with seven checks missing.
-check_true("extractor/ran wherever tomllib exists",
+check_true("extractors/ran wherever tomllib exists",
            ran or sys.version_info < (3, 11), "the executable checks were skipped on a 3.11+ run")
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
